@@ -237,17 +237,22 @@ def mark_attendance():
     """Allows a student to mark attendance using a QR token."""
     data = request.json
     student_id = data.get('student_id')
-    qr_token = data.get('qr_token')
+    qr_token_raw = data.get('qr_token')
+
+    # 🌟 CRITICAL FIX: Ensure the token is always cleaned (trimmed) and converted to a consistent case (e.g., UPPER).
+    qr_token = qr_token_raw.strip().upper() 
 
     conn = get_db_connection()
     
-    # 1. Check if the session is active
+    # 1. Check if the session is active (Lookup uses the UPPERCASE token)
     session_row = conn.execute("SELECT class_code, class_name FROM sessions WHERE qr_token = ?", (qr_token,)).fetchone()
     if not session_row:
         conn.close()
+        # This is where the error is coming from.
         return jsonify({"error": "Invalid or expired QR code/session."}), 400
     
     # 2. Check if student has already marked attendance for this session
+    # Note: Use the cleaned, uppercase token here too.
     already_marked = conn.execute("SELECT id FROM attendance WHERE student_id = ? AND qr_token = ?", 
                                   (student_id, qr_token)).fetchone()
     if already_marked:
@@ -275,13 +280,15 @@ def student_stats(student_id):
     total_classes_cursor = conn.execute("SELECT COUNT(DISTINCT qr_token) as count FROM sessions").fetchone()
     total_classes = total_classes_cursor['count']
     
-    # Get classes attended (marked as 'Present')
-    attended_cursor = conn.execute("SELECT COUNT(*) as count FROM attendance WHERE student_id = ? AND status = 'Present'", (student_id,)).fetchone()
+    # 🌟 CRITICAL FIX: Use COUNT(DISTINCT qr_token) to count unique sessions attended
+    attended_cursor = conn.execute("SELECT COUNT(DISTINCT qr_token) as count FROM attendance WHERE student_id = ? AND status = 'Present'", (student_id,)).fetchone()
     attended = attended_cursor['count']
     
     conn.close()
 
     percentage = (attended / total_classes * 100) if total_classes > 0 else 0
+    
+    # Missed calculation will now be correct as 'attended' <= 'total_classes'
     missed = total_classes - attended
 
     return jsonify({
