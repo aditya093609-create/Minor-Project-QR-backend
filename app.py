@@ -4,7 +4,6 @@ import time
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-# Note: We removed 'from sqlalchemy.engine import URL'
 from sqlalchemy import create_engine, text, Column, String, Float, TIMESTAMP
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -26,11 +25,9 @@ if not DATABASE_URL:
     print("FATAL: DATABASE_URL environment variable is not set. Cannot connect to Singlestore.")
     exit(1) 
 
-# Replace the pymysql dialect with the standard mysql dialect
-# This ensures we use the most compatible driver installed (e.g., mysqlclient or pymysql)
-# and simplify the URL for better parsing.
-# Example: mysql+pymysql://... becomes mysql://...
-CLEAN_DATABASE_URL = DATABASE_URL.replace("mysql+pymysql://", "mysql://")
+# IMPORTANT: We use the DATABASE_URL AS IS, which should start with mysql+pymysql://
+# This forces SQLAlchemy to use the PyMySQL driver, which is installed via requirements.txt.
+CLEAN_DATABASE_URL = DATABASE_URL
 
 engine = None
 Session = None
@@ -40,10 +37,11 @@ Base = declarative_base()
 
 def create_database_engine(url_string, ssl_mode):
     """Attempts to create the SQLAlchemy engine with specified SSL settings."""
-    print(f"Attempting connection with SSL mode: {ssl_mode}")
+    print(f"Attempting connection with URL: {url_string[:50]}... and SSL mode: {ssl_mode}")
     return create_engine(
         url_string, 
         connect_args={
+            # This is the crucial part for Singlestore/Cloud MySQL
             "ssl": {
                 "ssl_mode": ssl_mode
             }
@@ -67,11 +65,11 @@ except OperationalError as e:
         # If both fail, we exit
         exit(1)
 except Exception as e:
-    # Handle other general setup errors
+    # Handle other general setup errors (like the 'No module named MySQLdb' if the URL wasn't explicit)
     print(f"ERROR: Failed to create SQLAlchemy engine: {e}")
     exit(1)
 
-# --- Database Models (Define your tables) ---
+# --- Database Models (Unchanged) ---
 
 class User(Base):
     __tablename__ = 'users'
@@ -106,23 +104,21 @@ def initialize_db():
     """
     try:
         print("Attempting to connect to Singlestore and create tables...")
-        # This is the line that connects and creates the tables
         Base.metadata.create_all(engine)
         print("Database tables ensured to exist.")
     except Exception as e:
         print(f"FATAL: Database initialization error: {e}")
         raise e
 
-# --- Utility Functions ---
+# --- Utility Functions (Unchanged) ---
 
 def get_db_session():
     """Returns a new SQLAlchemy session."""
     if not Session:
-         # Should never happen if app starts correctly, but good for safety
          raise RuntimeError("Database session not initialized. Check server logs.")
     return Session()
 
-# --- API Routes ---
+# --- API Routes (Unchanged) ---
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -169,7 +165,6 @@ def register():
     except Exception as e:
         db_session.rollback()
         print(f"Registration error: {e}")
-        # This is the 'Internal Problem' error source
         return jsonify({"error": "An internal error occurred during registration."}), 500
     finally:
         db_session.close()
@@ -197,9 +192,6 @@ def login():
     else:
         return jsonify({"error": "Invalid username or password."}), 401
 
-
-# --- ADMIN Routes (Rest of the routes remain the same) ---
-# ... (omitted for brevity, assume the remaining routes are unchanged) ...
 
 @app.route('/admin/create_session', methods=['POST'])
 def create_session():
@@ -322,8 +314,6 @@ def update_attendance():
     finally:
         db_session.close()
 
-
-# --- STUDENT Routes (Rest of the routes remain the same) ---
 
 @app.route('/student/mark_attendance', methods=['POST'])
 def mark_attendance():
