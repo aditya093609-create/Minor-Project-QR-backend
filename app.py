@@ -29,8 +29,8 @@ if not DATABASE_URL:
 
 # Create the SQLAlchemy engine
 try:
-    engine = create_engine(DATABASE_URL)
-    Session = sessionmaker(bind=engine)
+    engine = create_engine("mysql+pymysql://aditya-55135:iH%25VWYI5vu6YZHnzYc%7B*FLBD%24f@svc-3482219c-a389-4079-b18b-d50662524e8a-shared-dml.aws-virginia-6.svc.singlestore.com:3333/QR_Database)
+    Session = sessionmaker(bind=engine")
     Base = declarative_base()
 except Exception as e:
     print(f"ERROR: Failed to create SQLAlchemy engine: {e}")
@@ -393,4 +393,3 @@ if __name__ == '__main__':
     
     # Use gunicorn to run on Render, but Flask for local dev
     app.run(debug=True, port=os.environ.get('PORT', 5000))
-
