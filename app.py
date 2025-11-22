@@ -25,7 +25,7 @@ if not DATABASE_URL:
     # IMPORTANT: You must configure the DATABASE_URL environment variable in Render.
     # This fallback is for local testing only.
     print("WARNING: DATABASE_URL not set. Using a dummy connection string for local test.")
-    DATABASE_URL = "mysql+pymysql://root:password@localhost/attendance_system_db"
+    DATABASE_URL = "mysql+pymysql://aditya-55135:iH%25VWYI5vu6YZHnzYc%7B*FLBD%24f@svc-3482219c-a389-4079-b18b-d50662524e8a-shared-dml.aws-virginia-6.svc.singlestore.com:3333/QR_Database"
 
 # Create the SQLAlchemy engine
 try:
@@ -393,3 +393,4 @@ if __name__ == '__main__':
     
     # Use gunicorn to run on Render, but Flask for local dev
     app.run(debug=True, port=os.environ.get('PORT', 5000))
+
