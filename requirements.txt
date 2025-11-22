@@ -1,6 +1,5 @@
-Flask
-Flask-CORS
-SQLAlchemy
-python-dotenv
-PyMySQL
 gunicorn
+flask
+qrcode
+Pillow
+python-dotenv
