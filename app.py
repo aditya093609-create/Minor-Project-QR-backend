@@ -7,7 +7,7 @@ from flask_cors import CORS
 # Note: We removed 'from sqlalchemy.engine import URL'
 from sqlalchemy import create_engine, text, Column, String, Float, TIMESTAMP
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from dotenv import load_dotenv
 
 # Load environment variables from a .env file locally (ignored in production on Render)
@@ -26,27 +26,49 @@ if not DATABASE_URL:
     print("FATAL: DATABASE_URL environment variable is not set. Cannot connect to Singlestore.")
     exit(1) 
 
-try:
-    # 1. Pass the DATABASE_URL string directly to create_engine.
-    # This avoids the incompatible URL object methods that caused the crash.
-    engine = create_engine(
-        DATABASE_URL, 
-        # 2. Add the mandatory SSL connection arguments for Singlestore/Cloud MySQL
+# Replace the pymysql dialect with the standard mysql dialect
+# This ensures we use the most compatible driver installed (e.g., mysqlclient or pymysql)
+# and simplify the URL for better parsing.
+# Example: mysql+pymysql://... becomes mysql://...
+CLEAN_DATABASE_URL = DATABASE_URL.replace("mysql+pymysql://", "mysql://")
+
+engine = None
+Session = None
+Base = declarative_base()
+
+# --- Connection Attempt Logic ---
+
+def create_database_engine(url_string, ssl_mode):
+    """Attempts to create the SQLAlchemy engine with specified SSL settings."""
+    print(f"Attempting connection with SSL mode: {ssl_mode}")
+    return create_engine(
+        url_string, 
         connect_args={
             "ssl": {
-                "ssl_mode": "preferred"
+                "ssl_mode": ssl_mode
             }
         },
         pool_timeout=15 
     )
-    
-    # Setup Session and Base objects
-    Session = sessionmaker(bind=engine)
-    Base = declarative_base()
 
+try:
+    # 1. Try recommended SSL preferred mode
+    engine = create_database_engine(CLEAN_DATABASE_URL, "preferred")
+    Session = sessionmaker(bind=engine)
+
+except OperationalError as e:
+    # 2. If SSL preferred failed (most common error), try disabling SSL completely as a fallback.
+    print(f"SSL preferred failed: {e}. Trying SSL disabled mode...")
+    try:
+        engine = create_database_engine(CLEAN_DATABASE_URL, "disabled")
+        Session = sessionmaker(bind=engine)
+    except Exception as e:
+        print(f"FATAL: Database connection failed even with SSL disabled: {e}")
+        # If both fail, we exit
+        exit(1)
 except Exception as e:
-    # This error message will now only show if the connection string itself is bad
-    print(f"ERROR: Failed to create SQLAlchemy engine and check Singlestore connection: {e}")
+    # Handle other general setup errors
+    print(f"ERROR: Failed to create SQLAlchemy engine: {e}")
     exit(1)
 
 # --- Database Models (Define your tables) ---
@@ -73,7 +95,6 @@ class Attendance(Base):
     student_id = Column(String(36), nullable=False)
     qr_token = Column(String(36), nullable=False)
     status = Column(String(10), nullable=False) # 'Present' or 'Absent'
-    # TIMESTAMP is the standard MySQL type
     timestamp = Column(TIMESTAMP, nullable=False)
 
 # --- Initialization Function ---
@@ -89,13 +110,16 @@ def initialize_db():
         Base.metadata.create_all(engine)
         print("Database tables ensured to exist.")
     except Exception as e:
-        print(f"FATAL: Database initialization error. Check DATABASE_URL and Singlestore service: {e}")
+        print(f"FATAL: Database initialization error: {e}")
         raise e
 
 # --- Utility Functions ---
 
 def get_db_session():
     """Returns a new SQLAlchemy session."""
+    if not Session:
+         # Should never happen if app starts correctly, but good for safety
+         raise RuntimeError("Database session not initialized. Check server logs.")
     return Session()
 
 # --- API Routes ---
@@ -115,7 +139,6 @@ def register():
 
     db_session = get_db_session()
     try:
-        # Check if username or (if student) rollno already exists
         if db_session.query(User).filter_by(username=username).first():
             return jsonify({"error": "Username already exists."}), 409
         
@@ -146,6 +169,7 @@ def register():
     except Exception as e:
         db_session.rollback()
         print(f"Registration error: {e}")
+        # This is the 'Internal Problem' error source
         return jsonify({"error": "An internal error occurred during registration."}), 500
     finally:
         db_session.close()
@@ -174,11 +198,11 @@ def login():
         return jsonify({"error": "Invalid username or password."}), 401
 
 
-# --- ADMIN Routes ---
+# --- ADMIN Routes (Rest of the routes remain the same) ---
+# ... (omitted for brevity, assume the remaining routes are unchanged) ...
 
 @app.route('/admin/create_session', methods=['POST'])
 def create_session():
-    """Creates a new attendance session and QR token."""
     data = request.get_json()
     class_name = data.get('class_name')
     class_code = data.get('class_code')
@@ -186,9 +210,8 @@ def create_session():
     if not all([class_name, class_code]):
         return jsonify({"error": "Missing class name or code."}), 400
 
-    # Generate a unique token
     qr_token = str(uuid.uuid4())
-    current_time = time.time() # Unix timestamp
+    current_time = time.time()
 
     db_session = get_db_session()
     try:
@@ -215,10 +238,8 @@ def create_session():
 
 @app.route('/admin/attendance', methods=['GET'])
 def admin_attendance():
-    """Fetches all attendance records and student statistics."""
     db_session = get_db_session()
     try:
-        # 1. Fetch All Records (Detailed View)
         records_query = db_session.query(
             Attendance.id,
             User.name.label('student_name'),
@@ -241,7 +262,6 @@ def admin_attendance():
             "timestamp": rec.timestamp.isoformat() if rec.timestamp else None
         } for rec in records_query.all()]
 
-        # 2. Calculate Student Stats (Summary View)
         total_classes = db_session.query(SessionRecord.qr_token).distinct().count()
 
         stats_query = db_session.query(
@@ -277,7 +297,6 @@ def admin_attendance():
 
 @app.route('/admin/update_attendance', methods=['POST'])
 def update_attendance():
-    """Manually updates an attendance record status."""
     data = request.get_json()
     record_id = data.get('record_id')
     new_status = data.get('status')
@@ -304,23 +323,20 @@ def update_attendance():
         db_session.close()
 
 
-# --- STUDENT Routes ---
+# --- STUDENT Routes (Rest of the routes remain the same) ---
 
 @app.route('/student/mark_attendance', methods=['POST'])
 def mark_attendance():
-    """Marks attendance for a student using a QR token."""
     data = request.get_json()
     student_id = data.get('student_id')
     qr_token = data.get('qr_token')
 
     db_session = get_db_session()
     try:
-        # 1. Check if the session is valid/exists
         session_record = db_session.query(SessionRecord).filter_by(qr_token=qr_token).first()
         if not session_record:
             return jsonify({"error": "Invalid or expired QR code/session."}), 404
         
-        # 2. Check if student is already marked present for this session
         existing_record = db_session.query(Attendance).filter_by(
             student_id=student_id, 
             qr_token=qr_token
@@ -334,11 +350,9 @@ def mark_attendance():
         timestamp = datetime.now()
 
         if existing_record:
-            # Update existing 'Absent' record to 'Present'
             existing_record.status = 'Present'
             existing_record.timestamp = timestamp
         else:
-            # Create a new attendance record
             new_record = Attendance(
                 id=str(uuid.uuid4()),
                 student_id=student_id,
@@ -365,13 +379,10 @@ def mark_attendance():
 
 @app.route('/student/stats/<student_id>', methods=['GET'])
 def student_stats(student_id):
-    """Fetches attendance statistics for a specific student."""
     db_session = get_db_session()
     try:
-        # Get total unique sessions
         total_classes = db_session.query(SessionRecord.qr_token).distinct().count()
         
-        # Get classes attended (marked as 'Present')
         attended = db_session.query(Attendance).filter(
             Attendance.student_id == student_id,
             Attendance.status == 'Present'
