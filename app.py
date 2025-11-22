@@ -1,406 +1,298 @@
-import os
+import sqlite3
 import uuid
 import time
-from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from sqlalchemy import create_engine, text, Column, String, Float, TIMESTAMP
-from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.exc import IntegrityError, OperationalError
-from dotenv import load_dotenv
-
-# Load environment variables from a .env file locally (ignored in production on Render)
-load_dotenv()
+from datetime import datetime
 
 app = Flask(__name__)
-# Enable CORS for frontend communication
-CORS(app) 
+# Enable CORS for all routes, allowing frontend to connect from different domain/port
+CORS(app)
 
-# --- Database Configuration ---
+DATABASE = 'attendance.db'
 
-# The connection string is read from the Render environment variable
-DATABASE_URL = os.environ.get('DATABASE_URL')
+# --- Database Setup and Initialization ---
 
-if not DATABASE_URL:
-    print("FATAL: DATABASE_URL environment variable is not set. Cannot connect to Singlestore.")
-    exit(1) 
-
-# IMPORTANT: We use the DATABASE_URL AS IS, which should start with mysql+pymysql://
-# This forces SQLAlchemy to use the PyMySQL driver, which is installed via requirements.txt.
-CLEAN_DATABASE_URL = DATABASE_URL
-
-engine = None
-Session = None
-Base = declarative_base()
-
-# --- Connection Attempt Logic ---
-
-def create_database_engine(url_string, ssl_mode):
-    """Attempts to create the SQLAlchemy engine with specified SSL settings."""
-    print(f"Attempting connection with URL: {url_string[:50]}... and SSL mode: {ssl_mode}")
-    return create_engine(
-        url_string, 
-        connect_args={
-            # This is the crucial part for Singlestore/Cloud MySQL
-            "ssl": {
-                "ssl_mode": ssl_mode
-            }
-        },
-        pool_timeout=15 
-    )
-
-try:
-    # 1. Try recommended SSL preferred mode
-    engine = create_database_engine(CLEAN_DATABASE_URL, "preferred")
-    Session = sessionmaker(bind=engine)
-
-except OperationalError as e:
-    # 2. If SSL preferred failed (most common error), try disabling SSL completely as a fallback.
-    print(f"SSL preferred failed: {e}. Trying SSL disabled mode...")
-    try:
-        engine = create_database_engine(CLEAN_DATABASE_URL, "disabled")
-        Session = sessionmaker(bind=engine)
-    except Exception as e:
-        print(f"FATAL: Database connection failed even with SSL disabled: {e}")
-        # If both fail, we exit
-        exit(1)
-except Exception as e:
-    # Handle other general setup errors (like the 'No module named MySQLdb' if the URL wasn't explicit)
-    print(f"ERROR: Failed to create SQLAlchemy engine: {e}")
-    exit(1)
-
-# --- Database Models (Unchanged) ---
-
-class User(Base):
-    __tablename__ = 'users'
-    id = Column(String(36), primary_key=True)
-    name = Column(String(100), nullable=False)
-    username = Column(String(50), unique=True, nullable=False)
-    password = Column(String(100), nullable=False)
-    role = Column(String(10), nullable=False) # 'admin' or 'student'
-    rollno = Column(String(20), unique=True, nullable=True) # Unique for students
-
-class SessionRecord(Base):
-    __tablename__ = 'sessions'
-    qr_token = Column(String(36), primary_key=True)
-    class_name = Column(String(100), nullable=False)
-    class_code = Column(String(20), nullable=False)
-    timestamp = Column(Float, nullable=False) # Unix timestamp
-
-class Attendance(Base):
-    __tablename__ = 'attendance'
-    id = Column(String(36), primary_key=True)
-    student_id = Column(String(36), nullable=False)
-    qr_token = Column(String(36), nullable=False)
-    status = Column(String(10), nullable=False) # 'Present' or 'Absent'
-    timestamp = Column(TIMESTAMP, nullable=False)
-
-# --- Initialization Function ---
+def get_db_connection():
+    """Connects to the SQLite database."""
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row  # Access columns by name
+    return conn
 
 def initialize_db():
-    """
-    Called when the application starts. 
-    Creates all defined tables if they don't exist in the connected database.
-    """
-    try:
-        print("Attempting to connect to Singlestore and create tables...")
-        Base.metadata.create_all(engine)
-        print("Database tables ensured to exist.")
-    except Exception as e:
-        print(f"FATAL: Database initialization error: {e}")
-        raise e
+    """Creates tables if they do not exist, including the new 'rollno' column."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Updated users table to include rollno
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            role TEXT NOT NULL, -- 'admin' or 'student'
+            rollno TEXT UNIQUE
+        )
+    """)
 
-# --- Utility Functions (Unchanged) ---
+    # Session table remains the same
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            qr_token TEXT PRIMARY KEY,
+            class_name TEXT NOT NULL,
+            class_code TEXT NOT NULL,
+            timestamp REAL NOT NULL
+        )
+    """)
 
-def get_db_session():
-    """Returns a new SQLAlchemy session."""
-    if not Session:
-         raise RuntimeError("Database session not initialized. Check server logs.")
-    return Session()
+    # Attendance table remains the same
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT NOT NULL,
+            qr_token TEXT NOT NULL,
+            status TEXT NOT NULL, -- 'Present' or 'Absent'
+            timestamp REAL NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# --- API Routes (Unchanged) ---
+# Initialize the database on startup
+initialize_db()
+
+
+# --- Authentication and Registration Routes ---
 
 @app.route('/register', methods=['POST'])
 def register():
-    """Handles new user registration."""
-    data = request.get_json()
+    """Registers a new user (admin or student)."""
+    data = request.json
     name = data.get('name')
     username = data.get('username')
-    password = data.get('password') 
+    password = data.get('password')
     role = data.get('role')
-    rollno = data.get('rollno', None)
+    rollno = data.get('rollno') # New field
 
-    if not all([username, password, role]):
-        return jsonify({"error": "Missing required fields."}), 400
+    if not all([name, username, password, role]):
+        return jsonify({"error": "Missing required fields: name, username, password, role"}), 400
+    
+    if role not in ['admin', 'student']:
+        return jsonify({"error": "Invalid role specified"}), 400
+    
+    # Roll number is required only for students
+    if role == 'student' and not rollno:
+         return jsonify({"error": "Students must provide a Roll Number"}), 400
 
-    db_session = get_db_session()
+    conn = get_db_connection()
     try:
-        if db_session.query(User).filter_by(username=username).first():
-            return jsonify({"error": "Username already exists."}), 409
-        
-        if role == 'student' and rollno and db_session.query(User).filter_by(rollno=rollno).first():
-            return jsonify({"error": "Roll Number already registered."}), 409
-        
-        new_user = User(
-            id=str(uuid.uuid4()),
-            name=name,
-            username=username,
-            password=password,
-            role=role,
-            rollno=rollno if role == 'student' else None
-        )
-
-        db_session.add(new_user)
-        db_session.commit()
-
-        return jsonify({
-            "message": f"User {username} registered successfully.",
-            "user_id": new_user.id,
-            "role": new_user.role
-        }), 201
-
-    except IntegrityError:
-        db_session.rollback()
+        user_id = str(uuid.uuid4())
+        # Insert user data, including rollno
+        conn.execute("INSERT INTO users (id, name, username, password, role, rollno) VALUES (?, ?, ?, ?, ?, ?)",
+                     (user_id, name, username, password, role, rollno))
+        conn.commit()
+        return jsonify({"message": f"{role.capitalize()} registration successful. You can now login.", "user_id": user_id}), 201
+    except sqlite3.IntegrityError:
         return jsonify({"error": "Username or Roll Number already exists."}), 409
-    except Exception as e:
-        db_session.rollback()
-        print(f"Registration error: {e}")
-        return jsonify({"error": "An internal error occurred during registration."}), 500
     finally:
-        db_session.close()
-
+        conn.close()
 
 @app.route('/login', methods=['POST'])
 def login():
-    """Handles user login."""
-    data = request.get_json()
+    """Logs in a user and returns user details and role."""
+    data = request.json
     username = data.get('username')
-    password = data.get('password') 
+    password = data.get('password')
 
-    db_session = get_db_session()
-    user = db_session.query(User).filter_by(username=username).first()
-    db_session.close()
+    conn = get_db_connection()
+    user_row = conn.execute("SELECT id, name, username, role, rollno FROM users WHERE username = ? AND password = ?", 
+                            (username, password)).fetchone()
+    conn.close()
 
-    if user and user.password == password: 
-        return jsonify({
-            "message": "Login successful!",
-            "user_id": user.id,
-            "name": user.name,
-            "role": user.role,
-            "rollno": user.rollno
-        }), 200
+    if user_row:
+        user = dict(user_row)
+        user['message'] = "Login successful."
+        user['user_id'] = user.pop('id')
+        
+        # Ensure rollno is included in the response for the frontend state
+        user['rollno'] = user.get('rollno') 
+        
+        return jsonify(user), 200
     else:
-        return jsonify({"error": "Invalid username or password."}), 401
+        return jsonify({"error": "Invalid username or password"}), 401
 
+
+# --- Admin Routes ---
 
 @app.route('/admin/create_session', methods=['POST'])
 def create_session():
-    data = request.get_json()
+    """Creates a new attendance session and generates a QR token."""
+    data = request.json
     class_name = data.get('class_name')
     class_code = data.get('class_code')
 
     if not all([class_name, class_code]):
-        return jsonify({"error": "Missing class name or code."}), 400
+        return jsonify({"error": "Missing class name or code"}), 400
+    
+    qr_token = str(uuid.uuid4())[:8].upper()
+    timestamp = time.time()
 
-    qr_token = str(uuid.uuid4())
-    current_time = time.time()
-
-    db_session = get_db_session()
+    conn = get_db_connection()
     try:
-        new_session = SessionRecord(
-            qr_token=qr_token,
-            class_name=class_name,
-            class_code=class_code,
-            timestamp=current_time
-        )
-        db_session.add(new_session)
-        db_session.commit()
-
+        # Clear any existing active session (for simplicity in this single-QR app)
+        conn.execute("DELETE FROM sessions")
+        
+        conn.execute("INSERT INTO sessions (qr_token, class_name, class_code, timestamp) VALUES (?, ?, ?, ?)",
+                     (qr_token, class_name, class_code, timestamp))
+        conn.commit()
         return jsonify({
-            "message": f"Session for {class_code} created.",
-            "qr_token": qr_token
+            "message": "Session created successfully.",
+            "qr_token": qr_token,
+            "class_name": class_name,
+            "class_code": class_code
         }), 201
     except Exception as e:
-        db_session.rollback()
-        print(f"Session creation error: {e}")
-        return jsonify({"error": "Internal error creating session."}), 500
+        return jsonify({"error": f"Database error: {str(e)}"}), 500
     finally:
-        db_session.close()
-
+        conn.close()
 
 @app.route('/admin/attendance', methods=['GET'])
-def admin_attendance():
-    db_session = get_db_session()
-    try:
-        records_query = db_session.query(
-            Attendance.id,
-            User.name.label('student_name'),
-            User.rollno.label('roll_no'),
-            SessionRecord.class_name,
-            SessionRecord.class_code,
-            Attendance.status,
-            Attendance.timestamp
-        ).join(User, Attendance.student_id == User.id)\
-         .join(SessionRecord, Attendance.qr_token == SessionRecord.qr_token)\
-         .order_by(Attendance.timestamp.desc())
+def admin_attendance_data():
+    """Fetches all attendance records and student attendance statistics."""
+    conn = get_db_connection()
+    
+    # 1. Fetch All Attendance Records (joining to get student name and rollno)
+    records_cursor = conn.execute("""
+        SELECT 
+            a.id, a.student_id, a.qr_token, a.status, a.timestamp, 
+            u.name as student_name, u.rollno as roll_no, 
+            s.class_name, s.class_code 
+        FROM attendance a
+        JOIN users u ON a.student_id = u.id
+        JOIN sessions s ON a.qr_token = s.qr_token
+        ORDER BY a.timestamp DESC
+    """)
+    records = [dict(row) for row in records_cursor.fetchall()]
 
-        records = [{
-            "id": rec.id,
-            "student_name": rec.student_name,
-            "roll_no": rec.roll_no,
-            "class_name": rec.class_name,
-            "class_code": rec.class_code,
-            "status": rec.status,
-            "timestamp": rec.timestamp.isoformat() if rec.timestamp else None
-        } for rec in records_query.all()]
+    # 2. Fetch Attendance Statistics
+    # Get all unique students
+    students_cursor = conn.execute("SELECT id, name, rollno FROM users WHERE role = 'student'")
+    students = students_cursor.fetchall()
 
-        total_classes = db_session.query(SessionRecord.qr_token).distinct().count()
+    # Get all unique classes (sessions)
+    total_classes_cursor = conn.execute("SELECT COUNT(DISTINCT qr_token) as count FROM sessions")
+    total_classes = total_classes_cursor.fetchone()['count']
+    
+    stats = []
+    for student in students:
+        attended_cursor = conn.execute("SELECT COUNT(*) as count FROM attendance WHERE student_id = ? AND status = 'Present'", (student['id'],))
+        attended = attended_cursor.fetchone()['count']
+        
+        percentage = (attended / total_classes * 100) if total_classes > 0 else 0
+        
+        stats.append({
+            "id": student['id'],
+            "name": student['name'],
+            "rollno": student['rollno'],
+            "attended": attended,
+            "total": total_classes,
+            "percentage": round(percentage, 1)
+        })
 
-        stats_query = db_session.query(
-            User.name,
-            User.rollno,
-            Attendance.student_id,
-            text("COUNT(CASE WHEN attendance.status = 'Present' THEN 1 END) as attended_count")
-        ).join(Attendance, User.id == Attendance.student_id, isouter=True)\
-         .filter(User.role == 'student')\
-         .group_by(User.id, User.name, User.rollno) 
+    # 3. Get Current Active QR Token
+    current_session = conn.execute("SELECT qr_token FROM sessions ORDER BY timestamp DESC LIMIT 1").fetchone()
+    current_qr_token = current_session['qr_token'] if current_session else None
+    
+    conn.close()
 
-        stats = []
-        for stat in stats_query.all():
-            attended = stat.attended_count or 0
-            percentage = (attended / total_classes * 100) if total_classes > 0 else 0
-            
-            stats.append({
-                "name": stat.name,
-                "rollno": stat.rollno,
-                "attended": attended,
-                "total": total_classes,
-                "percentage": round(percentage, 1)
-            })
-
-        return jsonify({"records": records, "stats": stats, "current_qr_token": None}), 200
-
-    except Exception as e:
-        print(f"Admin data fetch error: {e}")
-        return jsonify({"error": "Internal error fetching admin data."}), 500
-    finally:
-        db_session.close()
-
+    return jsonify({
+        "records": records,
+        "stats": stats,
+        "current_qr_token": current_qr_token
+    }), 200
 
 @app.route('/admin/update_attendance', methods=['POST'])
 def update_attendance():
-    data = request.get_json()
+    """Allows admin to manually change an attendance record status."""
+    data = request.json
     record_id = data.get('record_id')
-    new_status = data.get('status')
+    status = data.get('status')
 
-    if not all([record_id, new_status in ['Present', 'Absent']]):
-        return jsonify({"error": "Invalid record ID or status."}), 400
+    if not all([record_id, status]) or status not in ['Present', 'Absent']:
+        return jsonify({"error": "Invalid record ID or status"}), 400
 
-    db_session = get_db_session()
-    try:
-        attendance_record = db_session.query(Attendance).filter_by(id=record_id).first()
-        
-        if not attendance_record:
-            return jsonify({"error": "Attendance record not found."}), 404
+    conn = get_db_connection()
+    conn.execute("UPDATE attendance SET status = ? WHERE id = ?", (status, record_id))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"message": f"Record {record_id} updated to {status}."}), 200
 
-        attendance_record.status = new_status
-        db_session.commit()
-        
-        return jsonify({"message": f"Record {record_id} updated to {new_status}."}), 200
-    except Exception as e:
-        db_session.rollback()
-        print(f"Attendance update error: {e}")
-        return jsonify({"error": "Internal error updating attendance."}), 500
-    finally:
-        db_session.close()
 
+# --- Student Routes ---
 
 @app.route('/student/mark_attendance', methods=['POST'])
 def mark_attendance():
-    data = request.get_json()
+    """Allows a student to mark attendance using a QR token."""
+    data = request.json
     student_id = data.get('student_id')
     qr_token = data.get('qr_token')
 
-    db_session = get_db_session()
-    try:
-        session_record = db_session.query(SessionRecord).filter_by(qr_token=qr_token).first()
-        if not session_record:
-            return jsonify({"error": "Invalid or expired QR code/session."}), 404
-        
-        existing_record = db_session.query(Attendance).filter_by(
-            student_id=student_id, 
-            qr_token=qr_token
-        ).first()
+    conn = get_db_connection()
+    
+    # 1. Check if the session is active
+    session_row = conn.execute("SELECT class_code, class_name FROM sessions WHERE qr_token = ?", (qr_token,)).fetchone()
+    if not session_row:
+        conn.close()
+        return jsonify({"error": "Invalid or expired QR code/session."}), 400
+    
+    # 2. Check if student has already marked attendance for this session
+    already_marked = conn.execute("SELECT id FROM attendance WHERE student_id = ? AND qr_token = ?", 
+                                  (student_id, qr_token)).fetchone()
+    if already_marked:
+        conn.close()
+        return jsonify({"error": "Attendance already marked for this session."}), 400
 
-        if existing_record and existing_record.status == 'Present':
-            return jsonify({
-                "message": f"You are already marked Present for {session_record.class_code}."
-            }), 200
-        
-        timestamp = datetime.now()
+    # 3. Mark attendance
+    timestamp = time.time()
+    conn.execute("INSERT INTO attendance (student_id, qr_token, status, timestamp) VALUES (?, ?, ?, ?)",
+                 (student_id, qr_token, 'Present', timestamp))
+    conn.commit()
+    conn.close()
 
-        if existing_record:
-            existing_record.status = 'Present'
-            existing_record.timestamp = timestamp
-        else:
-            new_record = Attendance(
-                id=str(uuid.uuid4()),
-                student_id=student_id,
-                qr_token=qr_token,
-                status='Present',
-                timestamp=timestamp
-            )
-            db_session.add(new_record)
-
-        db_session.commit()
-
-        return jsonify({
-            "message": f"Attendance marked for {session_record.class_code}: {session_record.class_name}.",
-            "status": "Present"
-        }), 200
-
-    except Exception as e:
-        db_session.rollback()
-        print(f"Attendance marking error: {e}")
-        return jsonify({"error": "An internal error occurred while marking attendance."}), 500
-    finally:
-        db_session.close()
-
+    return jsonify({
+        "message": f"Attendance marked for {session_row['class_code']}: {session_row['class_name']}.",
+        "status": "Present"
+    }), 200
 
 @app.route('/student/stats/<student_id>', methods=['GET'])
 def student_stats(student_id):
-    db_session = get_db_session()
-    try:
-        total_classes = db_session.query(SessionRecord.qr_token).distinct().count()
-        
-        attended = db_session.query(Attendance).filter(
-            Attendance.student_id == student_id,
-            Attendance.status == 'Present'
-        ).count()
-        
-        db_session.close()
+    """Fetches attendance statistics for a specific student."""
+    conn = get_db_connection()
 
-        percentage = (attended / total_classes * 100) if total_classes > 0 else 0
-        missed = total_classes - attended
+    # Get total unique sessions
+    total_classes_cursor = conn.execute("SELECT COUNT(DISTINCT qr_token) as count FROM sessions").fetchone()
+    total_classes = total_classes_cursor['count']
+    
+    # Get classes attended (marked as 'Present')
+    attended_cursor = conn.execute("SELECT COUNT(*) as count FROM attendance WHERE student_id = ? AND status = 'Present'", (student_id,)).fetchone()
+    attended = attended_cursor['count']
+    
+    conn.close()
 
-        return jsonify({
-            "total_classes": total_classes,
-            "attended": attended,
-            "missed": missed,
-            "percentage": round(percentage, 1)
-        }), 200
-    except Exception as e:
-        print(f"Student stats error: {e}")
-        return jsonify({"error": "Internal error fetching stats."}), 500
-    finally:
-        db_session.close()
+    percentage = (attended / total_classes * 100) if total_classes > 0 else 0
+    missed = total_classes - attended
+
+    return jsonify({
+        "total_classes": total_classes,
+        "attended": attended,
+        "missed": missed,
+        "percentage": round(percentage, 1)
+    }), 200
 
 
 if __name__ == '__main__':
-    # This block is for local development only and is ignored by Gunicorn on Render.
-    try:
-        with app.app_context():
-            initialize_db() 
-        app.run(debug=True, port=os.environ.get('PORT', 5000))
-    except Exception as e:
-        print(f"Application failed to start locally: {e}")
+    # Use 0.0.0.0 for development if running in a container/VM, 
+    # but 127.0.0.1 (localhost) is fine for local testing.
+    app.run(debug=True, host='127.0.0.1', port=5000)
