@@ -1,5 +1,7 @@
 gunicorn
 flask
+flask-cors
 qrcode
 Pillow
 python-dotenv
+
