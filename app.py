@@ -4,10 +4,10 @@ import time
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+# Note: We removed 'from sqlalchemy.engine import URL'
 from sqlalchemy import create_engine, text, Column, String, Float, TIMESTAMP
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.engine import URL # Needed for advanced connection settings
 from dotenv import load_dotenv
 
 # Load environment variables from a .env file locally (ignored in production on Render)
@@ -24,25 +24,19 @@ DATABASE_URL = os.environ.get('DATABASE_URL')
 
 if not DATABASE_URL:
     print("FATAL: DATABASE_URL environment variable is not set. Cannot connect to Singlestore.")
-    # In production, we crash if the vital connection string is missing
     exit(1) 
 
 try:
-    # 1. Parse the URL string from the environment variable
-    url_object = URL.from_string(DATABASE_URL)
-    
-    # 2. Create the engine with SSL parameters (Crucial for Singlestore/Cloud MySQL)
-    # Most cloud database providers require SSL/TLS encryption.
+    # 1. Pass the DATABASE_URL string directly to create_engine.
+    # This avoids the incompatible URL object methods that caused the crash.
     engine = create_engine(
-        url_object,
+        DATABASE_URL, 
+        # 2. Add the mandatory SSL connection arguments for Singlestore/Cloud MySQL
         connect_args={
-            # Use 'preferred' to allow the connection to upgrade to SSL if available/required.
-            # If this fails, try "required"
             "ssl": {
                 "ssl_mode": "preferred"
             }
         },
-        # Optional: Increase connection timeout for slower cloud services
         pool_timeout=15 
     )
     
@@ -51,8 +45,8 @@ try:
     Base = declarative_base()
 
 except Exception as e:
+    # This error message will now only show if the connection string itself is bad
     print(f"ERROR: Failed to create SQLAlchemy engine and check Singlestore connection: {e}")
-    # Application must not continue if the database connection fails here
     exit(1)
 
 # --- Database Models (Define your tables) ---
@@ -79,7 +73,7 @@ class Attendance(Base):
     student_id = Column(String(36), nullable=False)
     qr_token = Column(String(36), nullable=False)
     status = Column(String(10), nullable=False) # 'Present' or 'Absent'
-    # TIMESTAMP is used here because MySQL supports it natively.
+    # TIMESTAMP is the standard MySQL type
     timestamp = Column(TIMESTAMP, nullable=False)
 
 # --- Initialization Function ---
@@ -91,12 +85,11 @@ def initialize_db():
     """
     try:
         print("Attempting to connect to Singlestore and create tables...")
-        # This command creates tables defined by Base.metadata if they don't exist
+        # This is the line that connects and creates the tables
         Base.metadata.create_all(engine)
         print("Database tables ensured to exist.")
     except Exception as e:
         print(f"FATAL: Database initialization error. Check DATABASE_URL and Singlestore service: {e}")
-        # Re-raise the exception to stop Gunicorn/Render from starting the service
         raise e
 
 # --- Utility Functions ---
@@ -153,7 +146,6 @@ def register():
     except Exception as e:
         db_session.rollback()
         print(f"Registration error: {e}")
-        # The internal error you are seeing is likely logged here.
         return jsonify({"error": "An internal error occurred during registration."}), 500
     finally:
         db_session.close()
@@ -407,9 +399,7 @@ if __name__ == '__main__':
     # This block is for local development only and is ignored by Gunicorn on Render.
     try:
         with app.app_context():
-            # Initialize tables when running locally
             initialize_db() 
         app.run(debug=True, port=os.environ.get('PORT', 5000))
     except Exception as e:
         print(f"Application failed to start locally: {e}")
-
