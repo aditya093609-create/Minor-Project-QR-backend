@@ -19,7 +19,7 @@ CORS(app) # Enable CORS for all routes
 
 # Use the DATABASE_URL environment variable provided by Render or defined locally
 # The URL format is typically: mysql+pymysql://user:password@host/database
-DATABASE_URL = os.environ.get('DATABASE_URL')
+DATABASE_URL = os.environ.get('mysql+pymysql://aditya-55135:iH%25VWYI5vu6YZHnzYc%7B*FLBD%24f@svc-3482219c-a389-4079-b18b-d50662524e8a-shared-dml.aws-virginia-6.svc.singlestore.com:3333/QR_Database')
 
 if not DATABASE_URL:
     # IMPORTANT: You must configure the DATABASE_URL environment variable in Render.
