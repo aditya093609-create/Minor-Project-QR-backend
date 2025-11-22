@@ -7,34 +7,53 @@ from flask_cors import CORS
 from sqlalchemy import create_engine, text, Column, String, Float, TIMESTAMP
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.engine import URL # Needed for advanced connection settings
 from dotenv import load_dotenv
 
-# Load environment variables from a .env file locally (ignored in production)
+# Load environment variables from a .env file locally (ignored in production on Render)
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app) # Enable CORS for all routes
+# Enable CORS for frontend communication
+CORS(app) 
 
 # --- Database Configuration ---
 
-# Use the DATABASE_URL environment variable provided by Render or defined locally
-# The URL format is typically: mysql+pymysql://user:password@host/database
-DATABASE_URL = os.environ.get('mysql+pymysql://aditya-55135:iH%25VWYI5vu6YZHnzYc%7B*FLBD%24f@svc-3482219c-a389-4079-b18b-d50662524e8a-shared-dml.aws-virginia-6.svc.singlestore.com:3333/QR_Database')
+# The connection string is read from the Render environment variable
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
 if not DATABASE_URL:
-    # IMPORTANT: You must configure the DATABASE_URL environment variable in Render.
-    # This fallback is for local testing only.
-    print("WARNING: DATABASE_URL not set. Using a dummy connection string for local test.")
-    DATABASE_URL = "mysql+pymysql://aditya-55135:iH%25VWYI5vu6YZHnzYc%7B*FLBD%24f@svc-3482219c-a389-4079-b18b-d50662524e8a-shared-dml.aws-virginia-6.svc.singlestore.com:3333/QR_Database"
+    print("FATAL: DATABASE_URL environment variable is not set. Cannot connect to Singlestore.")
+    # In production, we crash if the vital connection string is missing
+    exit(1) 
 
-# Create the SQLAlchemy engine
 try:
-    engine = create_engine("mysql+pymysql://aditya-55135:iH%25VWYI5vu6YZHnzYc%7B*FLBD%24f@svc-3482219c-a389-4079-b18b-d50662524e8a-shared-dml.aws-virginia-6.svc.singlestore.com:3333/QR_Database)
-    Session = sessionmaker(bind=engine")
+    # 1. Parse the URL string from the environment variable
+    url_object = URL.create.from_string(DATABASE_URL)
+    
+    # 2. Create the engine with SSL parameters (Crucial for Singlestore/Cloud MySQL)
+    # Most cloud database providers require SSL/TLS encryption.
+    engine = create_engine(
+        url_object,
+        connect_args={
+            # Use 'preferred' to allow the connection to upgrade to SSL if available/required.
+            # If this fails, try "required"
+            "ssl": {
+                "ssl_mode": "preferred"
+            }
+        },
+        # Optional: Increase connection timeout for slower cloud services
+        pool_timeout=15 
+    )
+    
+    # Setup Session and Base objects
+    Session = sessionmaker(bind=engine)
     Base = declarative_base()
+
 except Exception as e:
-    print(f"ERROR: Failed to create SQLAlchemy engine: {e}")
-    # Exit or handle the error gracefully in a real application
+    print(f"ERROR: Failed to create SQLAlchemy engine and check Singlestore connection: {e}")
+    # Application must not continue if the database connection fails here
+    exit(1)
 
 # --- Database Models (Define your tables) ---
 
@@ -60,23 +79,25 @@ class Attendance(Base):
     student_id = Column(String(36), nullable=False)
     qr_token = Column(String(36), nullable=False)
     status = Column(String(10), nullable=False) # 'Present' or 'Absent'
+    # TIMESTAMP is used here because MySQL supports it natively.
     timestamp = Column(TIMESTAMP, nullable=False)
 
 # --- Initialization Function ---
 
-@app.before_request
 def initialize_db():
     """
-    Called before the first request.
+    Called when the application starts. 
     Creates all defined tables if they don't exist in the connected database.
     """
     try:
-        # This will create tables in the external MySQL database
+        print("Attempting to connect to Singlestore and create tables...")
+        # This command creates tables defined by Base.metadata if they don't exist
         Base.metadata.create_all(engine)
+        print("Database tables ensured to exist.")
     except Exception as e:
-        # Log database creation errors, but allow app to continue if
-        # tables might already exist or if the DB is momentarily unavailable.
-        print(f"Database initialization error: {e}")
+        print(f"FATAL: Database initialization error. Check DATABASE_URL and Singlestore service: {e}")
+        # Re-raise the exception to stop Gunicorn/Render from starting the service
+        raise e
 
 # --- Utility Functions ---
 
@@ -92,7 +113,7 @@ def register():
     data = request.get_json()
     name = data.get('name')
     username = data.get('username')
-    password = data.get('password') # In a real app, hash this!
+    password = data.get('password') 
     role = data.get('role')
     rollno = data.get('rollno', None)
 
@@ -108,7 +129,6 @@ def register():
         if role == 'student' and rollno and db_session.query(User).filter_by(rollno=rollno).first():
             return jsonify({"error": "Roll Number already registered."}), 409
         
-        # Simple password storage for this example (In production, use werkzeug.security.generate_password_hash)
         new_user = User(
             id=str(uuid.uuid4()),
             name=name,
@@ -133,6 +153,7 @@ def register():
     except Exception as e:
         db_session.rollback()
         print(f"Registration error: {e}")
+        # The internal error you are seeing is likely logged here.
         return jsonify({"error": "An internal error occurred during registration."}), 500
     finally:
         db_session.close()
@@ -143,13 +164,13 @@ def login():
     """Handles user login."""
     data = request.get_json()
     username = data.get('username')
-    password = data.get('password') # In a real app, check against hashed password!
+    password = data.get('password') 
 
     db_session = get_db_session()
     user = db_session.query(User).filter_by(username=username).first()
     db_session.close()
 
-    if user and user.password == password: # Simple check
+    if user and user.password == password: 
         return jsonify({
             "message": "Login successful!",
             "user_id": user.id,
@@ -206,7 +227,6 @@ def admin_attendance():
     db_session = get_db_session()
     try:
         # 1. Fetch All Records (Detailed View)
-        # Using join for cleaner data retrieval
         records_query = db_session.query(
             Attendance.id,
             User.name.label('student_name'),
@@ -230,10 +250,8 @@ def admin_attendance():
         } for rec in records_query.all()]
 
         # 2. Calculate Student Stats (Summary View)
-        # Get total number of unique sessions
         total_classes = db_session.query(SessionRecord.qr_token).distinct().count()
 
-        # Group by student to calculate attended count
         stats_query = db_session.query(
             User.name,
             User.rollno,
@@ -241,12 +259,11 @@ def admin_attendance():
             text("COUNT(CASE WHEN attendance.status = 'Present' THEN 1 END) as attended_count")
         ).join(Attendance, User.id == Attendance.student_id, isouter=True)\
          .filter(User.role == 'student')\
-         .group_by(User.id, User.name, User.rollno) # Group by student details
+         .group_by(User.id, User.name, User.rollno) 
 
         stats = []
         for stat in stats_query.all():
             attended = stat.attended_count or 0
-            
             percentage = (attended / total_classes * 100) if total_classes > 0 else 0
             
             stats.append({
@@ -387,9 +404,11 @@ def student_stats(student_id):
 
 
 if __name__ == '__main__':
-    # When running locally, call initialize_db() to ensure tables exist
-    with app.app_context():
-        initialize_db()
-    
-    # Use gunicorn to run on Render, but Flask for local dev
-    app.run(debug=True, port=os.environ.get('PORT', 5000))
+    # This block is for local development only and is ignored by Gunicorn on Render.
+    try:
+        with app.app_context():
+            # Initialize tables when running locally
+            initialize_db() 
+        app.run(debug=True, port=os.environ.get('PORT', 5000))
+    except Exception as e:
+        print(f"Application failed to start locally: {e}")
