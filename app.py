@@ -29,7 +29,7 @@ if not DATABASE_URL:
 
 try:
     # 1. Parse the URL string from the environment variable
-    url_object = URL.create.from_string(DATABASE_URL)
+    url_object = URL.from_string(DATABASE_URL)
     
     # 2. Create the engine with SSL parameters (Crucial for Singlestore/Cloud MySQL)
     # Most cloud database providers require SSL/TLS encryption.
@@ -412,3 +412,4 @@ if __name__ == '__main__':
         app.run(debug=True, port=os.environ.get('PORT', 5000))
     except Exception as e:
         print(f"Application failed to start locally: {e}")
+
