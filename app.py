@@ -383,5 +383,11 @@ def student_stats(student_id):
         "percentage": round(percentage, 1)
     }), 200
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Endpoint for uptime monitors to check server status."""
+    return "OK", 200
+
 if __name__ == '__main__':
     app.run(debug=True, host='127.0.0.1', port=5000)
+
