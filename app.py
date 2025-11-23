@@ -3,6 +3,7 @@ import uuid
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+# 🔑 NEW: Import timedelta to handle date calculations
 from datetime import datetime, timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -146,21 +147,30 @@ def create_session():
     class_name = data.get('class_name')
     class_code = data.get('class_code')
     admin_class_id = data.get('class_id') 
+    session_date_str = data.get('date') # Gets date from frontend
 
-    if not all([class_name, class_code, admin_class_id]):
-        return jsonify({"error": "Missing class name, code, or Admin Class ID"}), 400
+    if not all([class_name, class_code, admin_class_id, session_date_str]):
+        return jsonify({"error": "Missing required fields"}), 400
     
     qr_token = str(uuid.uuid4())[:8].upper()
-    timestamp = time.time()
+    
+    try:
+        session_date = datetime.strptime(session_date_str, '%Y-%m-%d')
+        current_time = datetime.now().time()
+        session_datetime = datetime.combine(session_date, current_time)
+        timestamp = session_datetime.timestamp()
+    except ValueError:
+        return jsonify({"error": "Invalid date format"}), 400
 
     conn = get_db_connection()
     try:
-        # Clear only sessions belonging to this class_id (One active session policy)
-        conn.execute("DELETE FROM sessions WHERE class_id = ?", (admin_class_id,)) 
+        # 🚨 CRITICAL: I have REMOVED the 'DELETE FROM sessions' line.
+        # This ensures old attendance data stays in the database.
         
         conn.execute("INSERT INTO sessions (qr_token, class_name, class_code, timestamp, class_id) VALUES (?, ?, ?, ?, ?)",
                      (qr_token, class_name, class_code, timestamp, admin_class_id))
         conn.commit()
+        
         return jsonify({
             "qr_token": qr_token,
             "class_name": class_name,
@@ -383,11 +393,5 @@ def student_stats(student_id):
         "percentage": round(percentage, 1)
     }), 200
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Endpoint for uptime monitors to check server status."""
-    return "OK", 200
-
 if __name__ == '__main__':
     app.run(debug=True, host='127.0.0.1', port=5000)
-
