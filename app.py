@@ -3,12 +3,12 @@ import uuid
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-# 🔑 NEW: Import timedelta to handle date calculations
 from datetime import datetime, timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-CORS(app)
+# IMPORTANT: Use your deployed frontend URL here instead of just True for production
+CORS(app) 
 
 DATABASE = 'attendance.db'
 
@@ -21,7 +21,7 @@ def get_db_connection():
     return conn
 
 def initialize_db():
-    """Creates tables with all necessary fields (class_id, semester) and hashed passwords."""
+    """Creates tables."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -39,7 +39,7 @@ def initialize_db():
         )
     """)
 
-    # 🌟 SESSIONS TABLE
+    # 🌟 SESSIONS TABLE (Preserves history by date)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             qr_token TEXT PRIMARY KEY,
@@ -65,7 +65,7 @@ def initialize_db():
 
 initialize_db()
 
-# --- Authentication and Registration Routes ---
+# --- Authentication and Registration Routes (Unchanged) ---
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -85,12 +85,12 @@ def register():
         return jsonify({"error": "Invalid role specified"}), 400
     
     if role == 'student' and not all([rollno, semester]):
-         return jsonify({"error": "Students must provide a Roll Number and Semester"}), 400
+          return jsonify({"error": "Students must provide a Roll Number and Semester"}), 400
 
     conn = get_db_connection()
     try:
         user_id = str(uuid.uuid4())
-        hashed_password = generate_password_hash(password) # 🔑 Secure Hashing
+        hashed_password = generate_password_hash(password)
 
         if role == 'admin':
             sql = "INSERT INTO users (id, name, username, password, role, class_id) VALUES (?, ?, ?, ?, ?, ?)"
@@ -115,12 +115,11 @@ def login():
 
     conn = get_db_connection()
     user_row = conn.execute("SELECT id, name, username, role, rollno, password, class_id, semester FROM users WHERE username = ?", 
-                            (username,)).fetchone()
+                             (username,)).fetchone()
     conn.close()
 
     if user_row:
         user = dict(user_row)
-        # 🔑 Check password hash
         if check_password_hash(user['password'], password):
             return jsonify({
                 "message": "Login successful.",
@@ -131,7 +130,7 @@ def login():
                     "role": user['role'],
                     "rollno": user.get('rollno'),
                     "class_id": user.get('class_id'),   
-                    "semester": user.get('semester')  
+                    "semester": user.get('semester')   
                 }
             }), 200
         else:
@@ -150,23 +149,23 @@ def create_session():
     session_date_str = data.get('date') # Gets date from frontend
 
     if not all([class_name, class_code, admin_class_id, session_date_str]):
-        return jsonify({"error": "Missing required fields"}), 400
+        return jsonify({"error": "Missing required fields: Class Name, Code, Admin ID, or Date"}), 400
     
     qr_token = str(uuid.uuid4())[:8].upper()
     
     try:
+        # Parse the date provided by the admin (YYYY-MM-DD)
         session_date = datetime.strptime(session_date_str, '%Y-%m-%d')
+        # Combine with current time to ensure uniqueness and proper ordering
         current_time = datetime.now().time()
         session_datetime = datetime.combine(session_date, current_time)
         timestamp = session_datetime.timestamp()
     except ValueError:
-        return jsonify({"error": "Invalid date format"}), 400
+        return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
 
     conn = get_db_connection()
     try:
-        # 🚨 CRITICAL: I have REMOVED the 'DELETE FROM sessions' line.
-        # This ensures old attendance data stays in the database.
-        
+        # 🚨 FIX: Removed 'DELETE FROM sessions' line to preserve historical data.
         conn.execute("INSERT INTO sessions (qr_token, class_name, class_code, timestamp, class_id) VALUES (?, ?, ?, ?, ?)",
                      (qr_token, class_name, class_code, timestamp, admin_class_id))
         conn.commit()
@@ -183,10 +182,7 @@ def create_session():
 
 @app.route('/admin/attendance', methods=['POST'])
 def admin_attendance_data():
-    """
-    Fetches attendance records and statistics filtered by class_id.
-    🌟 NEW: Accepts optional 'date' parameter to filter by specific day.
-    """
+    """Fetches attendance records and statistics filtered by class_id and date."""
     data = request.json
     class_id = data.get('class_id') 
     target_date_str = data.get('date') # Format: YYYY-MM-DD
@@ -204,34 +200,42 @@ def admin_attendance_data():
         try:
             target_date = datetime.strptime(target_date_str, '%Y-%m-%d')
             start_of_day = target_date.timestamp()
+            # End of day is 23:59:59.999... which is start_of_day + 1 day
             end_of_day = (target_date + timedelta(days=1)).timestamp()
             
-            # This SQL fragment will be added to queries to filter sessions by time
+            # This SQL fragment filters sessions based on the selected date
             date_filter_sql = " AND s.timestamp >= ? AND s.timestamp < ?"
             date_params = [start_of_day, end_of_day]
         except ValueError:
             pass # Ignore invalid dates
 
-    # 1. Fetch Students (Always all students in the class)
+    # 1. Fetch Students (All students in the class)
     students_cursor = conn.execute("SELECT id, name, rollno FROM users WHERE role = 'student' AND class_id = ?", (class_id,)).fetchall()
     
     # 2. Get Total Sessions (Filtered by class AND date)
-    sessions_query = "SELECT COUNT(qr_token) as count FROM sessions s WHERE class_id = ?" + date_filter_sql
-    total_classes_cursor = conn.execute(sessions_query, (class_id, *date_params)).fetchone()
-    total_sessions_count = total_classes_cursor['count']
+    sessions_query = "SELECT qr_token, class_name FROM sessions s WHERE class_id = ?" + date_filter_sql
+    sessions_cursor = conn.execute(sessions_query, (class_id, *date_params)).fetchall()
+    total_sessions_count = len(sessions_cursor)
     
     stats = []
     for student in students_cursor:
         # 3. Get Student Attendance (Filtered by class AND date)
-        attended_query = f"""
-            SELECT COUNT(T1.id) AS count FROM attendance T1
-            JOIN sessions s ON T1.qr_token = s.qr_token
-            WHERE T1.student_id = ? AND T1.status = 'Present' AND s.class_id = ? {date_filter_sql}
-        """
-        attended_params = (student['id'], class_id, *date_params)
+        # We check which of the filtered sessions the student attended
+        session_tokens = [dict(s)['qr_token'] for s in sessions_cursor]
+        attended_count = 0
         
-        attended_cursor = conn.execute(attended_query, attended_params).fetchone()
-        attended = attended_cursor['count']
+        if session_tokens:
+            placeholders = ','.join('?' for _ in session_tokens)
+            attended_query = f"""
+                SELECT COUNT(id) AS count FROM attendance
+                WHERE student_id = ? AND status = 'Present' AND qr_token IN ({placeholders})
+            """
+            attended_params = (student['id'], *session_tokens)
+            
+            attended_cursor = conn.execute(attended_query, attended_params).fetchone()
+            attended_count = attended_cursor['count']
+        
+        attended = attended_count
         
         # Calculate percentage
         percentage = (attended / total_sessions_count * 100) if total_sessions_count > 0 else 0
@@ -261,7 +265,7 @@ def admin_attendance_data():
     records_cursor = conn.execute(records_query, records_params)
     records = [dict(row) for row in records_cursor.fetchall()]
 
-    # 5. Get Current Active QR Token (Always latest, not filtered by date)
+    # 5. Get Current Active QR Token (Always latest overall session for the class)
     current_session = conn.execute("SELECT qr_token FROM sessions WHERE class_id = ? ORDER BY timestamp DESC LIMIT 1", (class_id,)).fetchone()
     current_qr_token = current_session['qr_token'] if current_session else None
     
@@ -272,6 +276,8 @@ def admin_attendance_data():
         "stats": stats,
         "current_qr_token": current_qr_token
     }), 200
+
+# --- Remaining Admin & Student Routes (Unchanged and working) ---
 
 @app.route('/admin/update_attendance', methods=['POST'])
 def update_attendance():
@@ -292,7 +298,7 @@ def update_attendance():
 
 @app.route('/admin/delete_student', methods=['POST'])
 def delete_student():
-    """Deletes a student and all their records. Simplified to work reliably."""
+    """Deletes a student and all their records."""
     data = request.json
     student_id = data.get('student_id')
 
@@ -301,13 +307,8 @@ def delete_student():
 
     conn = get_db_connection()
     try:
-        # CRITICAL 1: Delete attendance records first (Foreign Key protection)
         conn.execute("DELETE FROM attendance WHERE student_id = ?", (student_id,))
-        
-        # CRITICAL 2: Delete user. 
-        # Removing class_id check here to ensure deletion works if ID is correct.
         result = conn.execute("DELETE FROM users WHERE id = ? AND role = 'student'", (student_id,))
-        
         conn.commit()
         
         if result.rowcount == 0:
@@ -320,8 +321,6 @@ def delete_student():
     finally:
         conn.close()
 
-# --- Student Routes ---
-
 @app.route('/student/mark_attendance', methods=['POST'])
 def mark_attendance():
     """Allows a student to mark attendance using a QR token."""
@@ -331,23 +330,29 @@ def mark_attendance():
 
     conn = get_db_connection()
     
-    # 1. Check if the session is active
-    session_row = conn.execute("SELECT class_code, class_name FROM sessions WHERE qr_token = ?", (qr_token,)).fetchone()
+    # 1. Check if the session is active and get class info
+    session_row = conn.execute("SELECT class_code, class_name, class_id FROM sessions WHERE qr_token = ?", (qr_token,)).fetchone()
     if not session_row:
         conn.close()
         return jsonify({"error": "Invalid or expired QR code/session."}), 400
-    
-    # 2. Check if student has already marked attendance for this session
+        
+    # 2. OPTIONAL: Check if student belongs to that class (security)
+    student_class = conn.execute("SELECT class_id FROM users WHERE id = ?", (student_id,)).fetchone()
+    if not student_class or student_class['class_id'] != session_row['class_id']:
+        conn.close()
+        return jsonify({"error": "Access denied: Token is not for your class."}), 403
+
+    # 3. Check if student has already marked attendance for this session
     already_marked = conn.execute("SELECT id FROM attendance WHERE student_id = ? AND qr_token = ?", 
                                   (student_id, qr_token)).fetchone()
     if already_marked:
         conn.close()
         return jsonify({"error": "Attendance already marked for this session."}), 400
 
-    # 3. Mark attendance
+    # 4. Mark attendance
     timestamp = time.time()
     conn.execute("INSERT INTO attendance (student_id, qr_token, status, timestamp) VALUES (?, ?, ?, ?)",
-                 (student_id, qr_token, 'Present', timestamp))
+                  (student_id, qr_token, 'Present', timestamp))
     conn.commit()
     conn.close()
 
@@ -361,7 +366,6 @@ def student_stats(student_id):
     """Fetches attendance statistics for a specific student."""
     conn = get_db_connection()
 
-    # Get student's class_id
     student_user_data = conn.execute("SELECT class_id FROM users WHERE id = ?", (student_id,)).fetchone()
     if not student_user_data:
         conn.close()
@@ -369,11 +373,9 @@ def student_stats(student_id):
 
     class_id = student_user_data['class_id']
     
-    # Get total unique sessions for the student's class
     total_classes_cursor = conn.execute("SELECT COUNT(qr_token) as count FROM sessions WHERE class_id = ?", (class_id,)).fetchone()
     total_classes = total_classes_cursor['count']
     
-    # Get classes attended
     attended_cursor = conn.execute("""
         SELECT COUNT(T1.id) AS count FROM attendance T1
         JOIN sessions T2 ON T1.qr_token = T2.qr_token
@@ -394,4 +396,5 @@ def student_stats(student_id):
     }), 200
 
 if __name__ == '__main__':
-    app.run(debug=True, host='127.0.0.1', port=5000)
+    # 🚨 FIX: Using '0.0.0.0' allows external access (required for testing mobile scanner)
+    app.run(debug=True, host='0.0.0.0', port=5000)
