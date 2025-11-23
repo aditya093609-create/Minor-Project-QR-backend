@@ -395,6 +395,11 @@ def student_stats(student_id):
         "percentage": round(percentage, 1)
     }), 200
 
+@app.route("/ping")
+def ping():
+    return "pong", 200
+
 if __name__ == '__main__':
     # 🚨 FIX: Using '0.0.0.0' allows external access (required for testing mobile scanner)
     app.run(debug=True, host='0.0.0.0', port=5000)
+
