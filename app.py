@@ -3,8 +3,8 @@ import uuid
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from datetime import datetime
-from werkzeug.security import generate_password_hash, check_password_hash # 🔑 NEW: For secure password handling
+from datetime import datetime, timedelta
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 CORS(app)
@@ -24,7 +24,7 @@ def initialize_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 🌟 USERS TABLE: Includes class_id, semester, and stores HASHED password
+    # 🌟 USERS TABLE
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
@@ -38,7 +38,7 @@ def initialize_db():
         )
     """)
 
-    # 🌟 SESSIONS TABLE: Includes class_id for filtering and clearing old sessions
+    # 🌟 SESSIONS TABLE
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             qr_token TEXT PRIMARY KEY,
@@ -49,7 +49,7 @@ def initialize_db():
         )
     """)
 
-    # Attendance table remains the same, but the admin route will filter it
+    # 🌟 ATTENDANCE TABLE
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS attendance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,7 +64,7 @@ def initialize_db():
 
 initialize_db()
 
-# --- Authentication and Registration Routes (Secure and Updated) ---
+# --- Authentication and Registration Routes ---
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -123,7 +123,7 @@ def login():
         if check_password_hash(user['password'], password):
             return jsonify({
                 "message": "Login successful.",
-                "user": { # 🌟 Structure response for the frontend
+                "user": { 
                     "user_id": user['id'],
                     "name": user['name'],
                     "username": user['username'],
@@ -138,7 +138,7 @@ def login():
     else:
         return jsonify({"error": "Invalid username or password"}), 401
 
-# --- Admin Routes (Filtered by class_id) ---
+# --- Admin Routes (Filtered by class_id & Date) ---
 
 @app.route('/admin/create_session', methods=['POST'])
 def create_session():
@@ -155,11 +155,9 @@ def create_session():
 
     conn = get_db_connection()
     try:
-        # CRITICAL: Clear only sessions belonging to this class_id
-        # For simplicity, we only allow one active session per class at a time.
+        # Clear only sessions belonging to this class_id (One active session policy)
         conn.execute("DELETE FROM sessions WHERE class_id = ?", (admin_class_id,)) 
         
-        # 🌟 INSERT NEW FIELD: class_id
         conn.execute("INSERT INTO sessions (qr_token, class_name, class_code, timestamp, class_id) VALUES (?, ?, ?, ?, ?)",
                      (qr_token, class_name, class_code, timestamp, admin_class_id))
         conn.commit()
@@ -175,30 +173,57 @@ def create_session():
 
 @app.route('/admin/attendance', methods=['POST'])
 def admin_attendance_data():
-    """Fetches attendance records and statistics filtered by class_id."""
+    """
+    Fetches attendance records and statistics filtered by class_id.
+    🌟 NEW: Accepts optional 'date' parameter to filter by specific day.
+    """
     data = request.json
     class_id = data.get('class_id') 
+    target_date_str = data.get('date') # Format: YYYY-MM-DD
 
     if not class_id:
-        return jsonify({"error": "Class ID is required for dashboard data filtering."}), 400
+        return jsonify({"error": "Class ID is required."}), 400
         
     conn = get_db_connection()
 
-    # 1. Fetch Students & Total Classes (Filtered by class_id)
+    # --- Date Filtering Logic ---
+    date_filter_sql = ""
+    date_params = []
+    
+    if target_date_str:
+        try:
+            target_date = datetime.strptime(target_date_str, '%Y-%m-%d')
+            start_of_day = target_date.timestamp()
+            end_of_day = (target_date + timedelta(days=1)).timestamp()
+            
+            # This SQL fragment will be added to queries to filter sessions by time
+            date_filter_sql = " AND s.timestamp >= ? AND s.timestamp < ?"
+            date_params = [start_of_day, end_of_day]
+        except ValueError:
+            pass # Ignore invalid dates
+
+    # 1. Fetch Students (Always all students in the class)
     students_cursor = conn.execute("SELECT id, name, rollno FROM users WHERE role = 'student' AND class_id = ?", (class_id,)).fetchall()
-    total_classes_cursor = conn.execute("SELECT COUNT(qr_token) as count FROM sessions WHERE class_id = ?", (class_id,)).fetchone()
+    
+    # 2. Get Total Sessions (Filtered by class AND date)
+    sessions_query = "SELECT COUNT(qr_token) as count FROM sessions s WHERE class_id = ?" + date_filter_sql
+    total_classes_cursor = conn.execute(sessions_query, (class_id, *date_params)).fetchone()
     total_sessions_count = total_classes_cursor['count']
     
     stats = []
     for student in students_cursor:
-        # CRITICAL: Join attendance with sessions to ensure we only count sessions for this class_id
-        attended_cursor = conn.execute("""
+        # 3. Get Student Attendance (Filtered by class AND date)
+        attended_query = f"""
             SELECT COUNT(T1.id) AS count FROM attendance T1
-            JOIN sessions T2 ON T1.qr_token = T2.qr_token
-            WHERE T1.student_id = ? AND T1.status = 'Present' AND T2.class_id = ?
-        """, (student['id'], class_id)).fetchone()
+            JOIN sessions s ON T1.qr_token = s.qr_token
+            WHERE T1.student_id = ? AND T1.status = 'Present' AND s.class_id = ? {date_filter_sql}
+        """
+        attended_params = (student['id'], class_id, *date_params)
         
+        attended_cursor = conn.execute(attended_query, attended_params).fetchone()
         attended = attended_cursor['count']
+        
+        # Calculate percentage
         percentage = (attended / total_sessions_count * 100) if total_sessions_count > 0 else 0
         
         stats.append({
@@ -210,8 +235,8 @@ def admin_attendance_data():
             "percentage": round(percentage, 1)
         })
 
-    # 2. Fetch All Attendance Records (Filtered by class_id)
-    records_cursor = conn.execute("""
+    # 4. Fetch Detailed Records (Filtered by class AND date)
+    records_query = f"""
         SELECT 
             a.id, a.student_id, a.qr_token, a.status, a.timestamp, 
             u.name as student_name, u.rollno as roll_no, 
@@ -219,12 +244,14 @@ def admin_attendance_data():
         FROM attendance a
         JOIN users u ON a.student_id = u.id
         JOIN sessions s ON a.qr_token = s.qr_token
-        WHERE s.class_id = ? AND u.class_id = ? 
+        WHERE s.class_id = ? AND u.class_id = ? {date_filter_sql}
         ORDER BY a.timestamp DESC
-    """, (class_id, class_id))
+    """
+    records_params = (class_id, class_id, *date_params)
+    records_cursor = conn.execute(records_query, records_params)
     records = [dict(row) for row in records_cursor.fetchall()]
 
-    # 3. Get Current Active QR Token (Filtered by class_id)
+    # 5. Get Current Active QR Token (Always latest, not filtered by date)
     current_session = conn.execute("SELECT qr_token FROM sessions WHERE class_id = ? ORDER BY timestamp DESC LIMIT 1", (class_id,)).fetchone()
     current_qr_token = current_session['qr_token'] if current_session else None
     
@@ -242,7 +269,6 @@ def update_attendance():
     data = request.json
     record_id = data.get('record_id')
     status = data.get('status')
-    # Note: No class_id check here, as record_id is primary key, assuming admin only has access to view/edit their class's records.
     
     if not all([record_id, status]) or status not in ['Present', 'Absent']:
         return jsonify({"error": "Invalid record ID or status"}), 400
@@ -256,7 +282,7 @@ def update_attendance():
 
 @app.route('/admin/delete_student', methods=['POST'])
 def delete_student():
-    """Deletes a student and all their associated attendance records (for the current simple schema)."""
+    """Deletes a student and all their records. Simplified to work reliably."""
     data = request.json
     student_id = data.get('student_id')
 
@@ -265,22 +291,21 @@ def delete_student():
 
     conn = get_db_connection()
     try:
-        # CRITICAL 1: Delete attendance records first
+        # CRITICAL 1: Delete attendance records first (Foreign Key protection)
         conn.execute("DELETE FROM attendance WHERE student_id = ?", (student_id,))
         
-        # CRITICAL 2: Delete the student, only checking ID and ROLE (since class_id doesn't exist in your current DB)
-        result = conn.execute("DELETE FROM users WHERE id = ? AND role = 'student'", 
-                              (student_id,))
+        # CRITICAL 2: Delete user. 
+        # Removing class_id check here to ensure deletion works if ID is correct.
+        result = conn.execute("DELETE FROM users WHERE id = ? AND role = 'student'", (student_id,))
         
         conn.commit()
         
         if result.rowcount == 0:
             return jsonify({"error": "Student not found."}), 404
 
-        return jsonify("Student deleted successfully"), 200
+        return jsonify({"message": "Student deleted successfully"}), 200
     except Exception as e:
         conn.rollback()
-        # This will now return the error message instead of crashing silently
         return jsonify({"error": f"Database error during deletion: {str(e)}"}), 500
     finally:
         conn.close()
@@ -338,8 +363,7 @@ def student_stats(student_id):
     total_classes_cursor = conn.execute("SELECT COUNT(qr_token) as count FROM sessions WHERE class_id = ?", (class_id,)).fetchone()
     total_classes = total_classes_cursor['count']
     
-    # Get classes attended (marked as 'Present')
-    # CRITICAL: Join with sessions to ensure only sessions for their class are counted
+    # Get classes attended
     attended_cursor = conn.execute("""
         SELECT COUNT(T1.id) AS count FROM attendance T1
         JOIN sessions T2 ON T1.qr_token = T2.qr_token
@@ -358,7 +382,6 @@ def student_stats(student_id):
         "missed": missed,
         "percentage": round(percentage, 1)
     }), 200
-
 
 if __name__ == '__main__':
     app.run(debug=True, host='127.0.0.1', port=5000)
